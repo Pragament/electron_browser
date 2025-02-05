@@ -1,15 +1,86 @@
 const { ipcRenderer } = require('electron');
 const { writeFile } = require('fs');
+const { tmpdir } = require('os');
+const path = require('path');
+const { store } = require('../main/utils/store.js');
+const { saveGraphQLEndpoints, getGraphQLEndpoints } = require('../main/utils/store.js');
+const ffmpeg = require('fluent-ffmpeg');
+ffmpeg.setFfmpegPath('/opt/homebrew/bin/ffmpeg'); 
+let allowedDomains = [];
+
+// Fetch allowed domains from the GraphQL API
+async function fetchAllowedDomains() {
+  try {
+    const { graphqlEndpointForUrls } = getGraphQLEndpoints();
+    const response = await fetch(graphqlEndpointForUrls, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query: `
+          query {
+            getAllWebsiteLists {
+              domain
+            }
+          }
+        `,
+      }),
+    });
+
+    const result = await response.json();
+    allowedDomains = result.data.getAllWebsiteLists.map((item) => item.domain.trim().toLowerCase());
+    console.log('Allowed domains:', allowedDomains);
+  } catch (error) {
+    console.error('Error fetching allowed domains:', error);
+  }
+}
+
+// Function to log website navigation
+async function logWebsiteNavigation(category, pageUrl, domain) {
+  try {
+    // Get device ID using ipcRenderer to communicate with the main process
+    const deviceID = "6792056132ec51cc682947fa";
+
+    const mutation = `
+      mutation {
+        createWebsiteUsageLogOrList(
+          category: "${category}",
+          page_url: "${pageUrl}",
+          device_id: "${deviceID}",
+          domain: "${domain}"
+        ) {
+          _id
+        }
+      }
+    `;
+
+    const response = await fetch('http://localhost:5008/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query: mutation }),
+    });
+
+    const result = await response.json();
+    console.log('Website usage logged:', result);
+  } catch (error) {
+    console.error('Error logging website usage:', error);
+  }
+}
 
 // Webview controls
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
+  await fetchAllowedDomains(); // Fetch domains on startup
+
   const searchButton = document.getElementById('search-button');
   const urlInput = document.getElementById('url-input');
   const webview = document.getElementById('webview');
   const prevButton = document.getElementById('prev-button');
   const nextButton = document.getElementById('next-button');
 
-  // When the "Search" button is clicked, load the URL into the webview
+  // When the "Search" button is clicked, validate and load the URL into the webview
   searchButton.addEventListener('click', () => {
     let url = urlInput.value.trim();
 
@@ -18,34 +89,38 @@ window.addEventListener('DOMContentLoaded', () => {
       url = 'https://' + url;
     }
 
-    // Update the webview source
-    webview.src = url;
+    const domain = new URL(url).hostname.toLowerCase();
+
+    // Validate the domain
+    if (allowedDomains.includes(domain)) {
+      webview.src = url; // Load the URL if it's in the allowed list
+
+      // Log the website navigation
+      logWebsiteNavigation('Navigation', url, domain);
+    } else {
+      alert('Access to this website is not allowed.');
+    }
   });
 
-  // Capture navigation events for the webview inside the main window
+  // Log navigation for in-page and other events
   webview.addEventListener('did-navigate', (event) => {
-    console.log('Navigated to:', event.url);
-
-    // Update the search input field to reflect the new URL
+    const domain = new URL(event.url).hostname.toLowerCase();
+    logWebsiteNavigation('Navigation', event.url, domain);
     urlInput.value = event.url;
   });
 
-  // Capture in-page navigation (like anchor tag clicks)
   webview.addEventListener('did-navigate-in-page', (event) => {
-    console.log('In-page navigation to:', event.url);
-
-    // Update the search input field to reflect the new URL
+    const domain = new URL(event.url).hostname.toLowerCase();
+    logWebsiteNavigation('In-page Navigation', event.url, domain);
     urlInput.value = event.url;
   });
 
-  // When "Back" button is clicked, navigate to the previous page in history
   prevButton.addEventListener('click', () => {
     if (webview.canGoBack()) {
       webview.goBack();
     }
   });
 
-  // When "Forward" button is clicked, navigate to the next page in history
   nextButton.addEventListener('click', () => {
     if (webview.canGoForward()) {
       webview.goForward();
@@ -73,16 +148,9 @@ closeSettingsButton.addEventListener('click', () => {
 saveSettingsButton.addEventListener('click', async () => {
   const deviceId = document.getElementById('deviceId').value;
   const computerName = document.getElementById('computerName').value;
-
-  // Send the settings data to the main process to save using Electron Store
-  const response = await ipcRenderer.invoke('save-settings', deviceId, computerName);
-
-  if (response.success) {
-    console.log('Settings saved successfully!');
-    settingsModal.style.display = 'none'; // Close modal after saving
-  } else {
-    console.error('Failed to save settings.');
-  }
+  saveGraphQLEndpoints(deviceId, computerName);
+  console.log(getGraphQLEndpoints());
+  settingsModal.style.display = 'none';
 });
 
 // Screen recording functionality
@@ -93,6 +161,12 @@ const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const videoSelectBtn = document.getElementById('videoSelectBtn');
 const selectMenu = document.getElementById('selectMenu');
+const trimVideoModal = document.getElementById('trimVideoModal');
+const recordedVideo = document.getElementById('recordedVideo');
+const startTimeInput = document.getElementById('startTime');
+const endTimeInput = document.getElementById('endTime');
+const trimVideoButton = document.getElementById('trimVideoButton');
+const closeTrimModal = document.getElementById('closeTrimModal');
 
 // Start recording button
 startBtn.onclick = async () => {
@@ -122,7 +196,7 @@ async function startRecording() {
   const screenId = selectMenu.options[selectMenu.selectedIndex].value;
 
   // AUDIO WON'T WORK ON MACOS
-  const isMacOS = (await ipcRenderer.invoke('getOperatingSystem')) === 'darwin';
+  const isMacOS = (await ipcRenderer.invoke('get-operating-system')) === 'darwin';
   const audio = !isMacOS
     ? {
         mandatory: {
@@ -168,24 +242,155 @@ async function stopRecording() {
     type: 'video/webm; codecs=vp9',
   });
 
-  const buffer = Buffer.from(await blob.arrayBuffer());
   recordedChunks = [];
+
+  // Create a URL for the recorded video
+  const videoUrl = URL.createObjectURL(blob);
+  recordedVideo.src = videoUrl;
+
+  // Set max values for start and end time inputs
+  recordedVideo.addEventListener('loadedmetadata', () => {
+    const duration = recordedVideo.duration;
+    startTimeInput.max = duration;
+    endTimeInput.max = duration;
+  });
+
+  // Show the trim video modal
+  trimVideoModal.style.display = 'block';
+}
+
+// Trim video button click event
+trimVideoButton.onclick = async () => {
+  const startTime = parseFloat(startTimeInput.value);
+  const endTime = parseFloat(endTimeInput.value);
+
+  if (isNaN(startTime) || isNaN(endTime) || startTime >= endTime) {
+    alert('Invalid start or end time.');
+    return;
+  }
 
   const { canceled, filePath } = await ipcRenderer.invoke('showSaveDialog');
   if (canceled) return;
 
   if (filePath) {
-    writeFile(filePath, buffer, () => console.log('Video saved successfully!'));
+    await extractVideoSegment(recordedVideo.src, startTime, endTime, filePath);
+    trimVideoModal.style.display = 'none';
   }
+};
+
+// Close trim modal button click event
+closeTrimModal.onclick = () => {
+  trimVideoModal.style.display = 'none';
+};
+
+// Extract video segment using fluent-ffmpeg
+async function extractVideoSegment(videoUrl, start, end, outputFilePath) {
+  // First, convert the blob URL to a buffer
+  const response = await fetch(videoUrl);
+  const buffer = await response.blob().then(blob => blob.arrayBuffer());
+
+  // Save the buffer as a temporary video file
+  const tempFilePath = path.join(tmpdir(), 'temp-video.webm');
+  writeFile(tempFilePath, Buffer.from(buffer), (err) => {
+    if (err) {
+      console.error('Error saving video file:', err);
+      return;
+    }
+
+    // Now that the video is saved, run ffmpeg to extract the segment
+    ffmpeg(tempFilePath)
+      .setStartTime(start)
+      .setDuration(end - start)
+      .output(outputFilePath)
+      .on('end', () => {
+        console.log('Video extraction completed');
+      })
+      .on('error', (err) => {
+        console.error('Error extracting video segment:', err);
+      })
+      .run();
+  });
 }
 
-    
 document.getElementById('startPollBtn').onclick = () => {
   ipcRenderer.send('open-poll'); // Open poll window when clicked
 };
 
-
-    
 document.getElementById('startQuizBtn').onclick = () => {
-  ipcRenderer.send('open-quiz'); // Open poll window when clicked
+  ipcRenderer.send('open-quiz'); // Open quiz window when clicked
 };
+
+
+let trimmedSegments = []; // Store trimmed segments
+
+// Save Trim (Stores multiple trimmed parts)
+document.getElementById('saveTrimButton').onclick = async () => {
+  const startTime = parseFloat(startTimeInput.value);
+  const endTime = parseFloat(endTimeInput.value);
+
+  if (isNaN(startTime) || isNaN(endTime) || startTime >= endTime) {
+    alert('Invalid start or end time.');
+    return;
+  }
+
+  const tempSegmentPath = path.join(tmpdir(), `segment_${trimmedSegments.length}.webm`);
+  
+  await extractVideoSegment(recordedVideo.src, startTime, endTime, tempSegmentPath);
+  trimmedSegments.push(tempSegmentPath);
+
+  console.log('Segment saved:', tempSegmentPath);
+  alert(`Segment ${trimmedSegments.length} saved!`);
+};
+
+// Finalize and Merge Video
+document.getElementById('finalizeTrimButton').onclick = async () => {
+  if (trimmedSegments.length === 0) {
+    alert('No trimmed segments to merge.');
+    return;
+  }
+
+  const { canceled, filePath } = await ipcRenderer.invoke('showSaveDialog');
+  if (canceled) return;
+
+  if (filePath) {
+    await mergeVideoSegments(trimmedSegments, filePath);
+    alert('Final video saved successfully!');
+    trimmedSegments = []; // Reset after saving
+    trimVideoModal.style.display = 'none';
+  }
+};
+
+// Function to merge multiple segments
+async function mergeVideoSegments(segmentPaths, outputFilePath) {
+  const fileListPath = path.join(tmpdir(), 'segments.txt');
+
+  // Create a file listing all trimmed segments
+  const fileContent = segmentPaths.map(p => `file '${p}'`).join('\n');
+
+  return new Promise((resolve, reject) => {
+    writeFile(fileListPath, fileContent, (err) => {
+      if (err) {
+        console.error('Error writing segment list:', err);
+        reject(err);
+        return;
+      }
+
+      console.log('File list created at:', fileListPath);
+
+      // Merge segments using FFmpeg
+      ffmpeg()
+        .input(fileListPath)
+        .inputOptions(['-f concat', '-safe 0']) // Correct way to pass options
+        .output(outputFilePath)
+        .on('end', () => {
+          console.log('Merging completed');
+          resolve();
+        })
+        .on('error', (err) => {
+          console.error('Error merging video:', err);
+          reject(err);
+        })
+        .run();
+    });
+  });
+}
